@@ -6,6 +6,16 @@ defined('MOODLE_INTERNAL') || die();
 
 /** Native Core completion writes must join the same course preservation barrier. */
 final class core_flow_completion_barrier_test extends \advanced_testcase {
+    protected function setUp(): void {
+        parent::setUp();
+        global $CFG;
+        foreach (['mod/examflow', 'mod/slideflow', 'report/reportsflow'] as $component) {
+            if (!is_file($CFG->dirroot . '/' . $component . '/version.php')) {
+                $this->markTestSkipped('Flow integration plugins are not installed in this Moodle checkout.');
+            }
+        }
+    }
+
     public static function flow_modules(): array {
         return ['examflow' => ['examflow'], 'slideflow' => ['slideflow']];
     }

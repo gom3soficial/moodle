@@ -4,8 +4,8 @@ if (PHP_SAPI !== 'cli' || count($argv) !== 3 || !preg_match('/^[1-9][0-9]*$/D', 
     exit(2);
 }
 define('PHPUNIT_UTIL', true);
-require_once dirname(__DIR__, 5) . '/vendor/autoload.php';
-require_once dirname(__DIR__, 5) . '/public/lib/phpunit/bootstrap.php';
+require_once dirname(__DIR__, 4) . '/vendor/autoload.php';
+require_once dirname(__DIR__, 4) . '/public/lib/phpunit/bootstrap.php';
 
 $courseid = (int)$argv[1];
 $ready = $argv[2];

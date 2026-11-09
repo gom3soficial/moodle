@@ -6,6 +6,16 @@ defined('MOODLE_INTERNAL') || die();
 
 /** Native integration of the isolated Moodle Core course writer with Flow modules. */
 final class core_flow_modlib_barrier_test extends \advanced_testcase {
+    protected function setUp(): void {
+        parent::setUp();
+        global $CFG;
+        foreach (['mod/examflow', 'mod/slideflow', 'report/reportsflow'] as $component) {
+            if (!is_file($CFG->dirroot . '/' . $component . '/version.php')) {
+                $this->markTestSkipped('Flow integration plugins are not installed in this Moodle checkout.');
+            }
+        }
+    }
+
     public function test_examflow_modedit_update_reaches_activity_and_gradebook(): void {
         global $CFG, $DB;
         $this->resetAfterTest(true);
