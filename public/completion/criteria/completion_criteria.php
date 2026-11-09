@@ -105,6 +105,104 @@ $COMPLETION_CRITERIA_TYPES = array(
  */
 abstract class completion_criteria extends data_object {
 
+    /** Include the prerequisite course for course-type criteria. */
+    private static function flow_criterion_scopes(int $courseid, int $type, int $prerequisiteid): array {
+        $ids = [$courseid];
+        if ($type === COMPLETION_CRITERIA_TYPE_COURSE) {
+            $ids[] = $prerequisiteid;
+        }
+        $ids = array_values(array_unique($ids));
+        if (array_filter($ids, static fn($id) => $id < 1)) {
+            throw new \report_reportsflow\local\preservation_unavailable_exception('record_scope_invalid');
+        }
+        sort($ids, SORT_NUMERIC);
+        return $ids;
+    }
+
+    /** Serialize criterion creation with clears of either related course. */
+    public function insert() {
+        $provider = '\\report_reportsflow\\local\\regulatory_completion_preservation_service';
+        if (!class_exists($provider)) {
+            return parent::insert();
+        }
+        $courseid = (int)$this->course;
+        $type = (int)$this->criteriatype;
+        $prerequisiteid = (int)$this->courseinstance;
+        $courseids = self::flow_criterion_scopes($courseid, $type, $prerequisiteid);
+        return $provider::with_course_barriers($courseids, function() use ($provider, $courseids,
+                $courseid, $type, $prerequisiteid) {
+            foreach ($courseids as $id) {
+                $provider::assert_course_barrier($id);
+            }
+            if ((int)$this->course !== $courseid || (int)$this->criteriatype !== $type
+                    || (int)$this->courseinstance !== $prerequisiteid) {
+                throw new \report_reportsflow\local\preservation_unavailable_exception('record_scope_changed');
+            }
+            return parent::insert();
+        });
+    }
+
+    /** Lock both owning and prerequisite courses before a criterion is moved. */
+    public function update() {
+        global $DB;
+        $provider = '\\report_reportsflow\\local\\regulatory_completion_preservation_service';
+        if (!class_exists($provider) || empty($this->id)) {
+            return parent::update();
+        }
+        $old = $DB->get_record($this->table, ['id' => $this->id],
+            'id,course,criteriatype,courseinstance', MUST_EXIST);
+        $newcourseid = (int)$this->course;
+        $newtype = (int)$this->criteriatype;
+        $newprerequisiteid = (int)$this->courseinstance;
+        $courseids = array_values(array_unique(array_merge(
+            self::flow_criterion_scopes((int)$old->course, (int)$old->criteriatype, (int)$old->courseinstance),
+            self::flow_criterion_scopes($newcourseid, $newtype, $newprerequisiteid))));
+        sort($courseids, SORT_NUMERIC);
+        return $provider::with_course_barriers($courseids, function() use ($DB, $provider,
+                $courseids, $old, $newcourseid, $newtype, $newprerequisiteid) {
+            foreach ($courseids as $courseid) {
+                $provider::assert_course_barrier($courseid);
+            }
+            $fresh = $DB->get_record($this->table, ['id' => $this->id],
+                'id,course,criteriatype,courseinstance', MUST_EXIST);
+            if ((int)$fresh->course !== (int)$old->course
+                    || (int)$fresh->criteriatype !== (int)$old->criteriatype
+                    || (int)$fresh->courseinstance !== (int)$old->courseinstance
+                    || (int)$this->course !== $newcourseid
+                    || (int)$this->criteriatype !== $newtype
+                    || (int)$this->courseinstance !== $newprerequisiteid) {
+                throw new \report_reportsflow\local\preservation_unavailable_exception('record_scope_changed');
+            }
+            return parent::update();
+        });
+    }
+
+    /** Deletion locks the authoritative owner and prerequisite, not stale object fields. */
+    public function delete() {
+        global $DB;
+        $provider = '\\report_reportsflow\\local\\regulatory_completion_preservation_service';
+        if (!class_exists($provider) || empty($this->id)) {
+            return parent::delete();
+        }
+        $old = $DB->get_record($this->table, ['id' => $this->id],
+            'id,course,criteriatype,courseinstance', MUST_EXIST);
+        $courseids = self::flow_criterion_scopes((int)$old->course,
+            (int)$old->criteriatype, (int)$old->courseinstance);
+        return $provider::with_course_barriers($courseids, function() use ($DB, $provider, $courseids, $old) {
+            foreach ($courseids as $courseid) {
+                $provider::assert_course_barrier($courseid);
+            }
+            $fresh = $DB->get_record($this->table, ['id' => $this->id],
+                'id,course,criteriatype,courseinstance', MUST_EXIST);
+            if ((int)$fresh->course !== (int)$old->course
+                    || (int)$fresh->criteriatype !== (int)$old->criteriatype
+                    || (int)$fresh->courseinstance !== (int)$old->courseinstance) {
+                throw new \report_reportsflow\local\preservation_unavailable_exception('record_scope_changed');
+            }
+            return parent::delete();
+        });
+    }
+
     /* @var string Database table name that stores completion criteria information  */
     public $table = 'course_completion_criteria';
 

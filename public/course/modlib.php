@@ -47,6 +47,17 @@ require_once($CFG->dirroot.'/course/lib.php');
  * @return object the updated module info
  */
 function add_moduleinfo($moduleinfo, $course, $mform = null) {
+    $provider = '\\report_reportsflow\\local\\regulatory_completion_preservation_service';
+    if (in_array((string)($moduleinfo->modulename ?? ''), ['examflow', 'slideflow'], true)
+            && class_exists($provider)) {
+        return $provider::with_course_barriers([(int)$course->id],
+            static fn() => add_moduleinfo_under_flow_barrier($moduleinfo, $course, $mform));
+    }
+    return add_moduleinfo_under_flow_barrier($moduleinfo, $course, $mform);
+}
+
+/** Keep the Flow course barrier before Core's first course-module write. */
+function add_moduleinfo_under_flow_barrier($moduleinfo, $course, $mform = null) {
     global $DB, $CFG;
 
     // Attempt to include module library before we make any changes to DB.
@@ -623,6 +634,25 @@ function can_update_moduleinfo($cm) {
  * @return array list of course module and module info.
  */
 function update_moduleinfo($cm, $moduleinfo, $course, $mform = null) {
+    global $DB;
+    $provider = '\\report_reportsflow\\local\\regulatory_completion_preservation_service';
+    if (in_array((string)($moduleinfo->modulename ?? ''), ['examflow', 'slideflow'], true)
+            && class_exists($provider)) {
+        $courseid = (int)$course->id;
+        return $provider::with_course_barriers([$courseid], static function() use (
+                $DB, $cm, $moduleinfo, $course, $mform, $courseid, $provider) {
+            if ((int)$DB->get_field('course_modules', 'course', ['id' => (int)$cm->id], MUST_EXIST) !== $courseid) {
+                throw new \moodle_exception('invalidcoursemodule');
+            }
+            $provider::assert_course_barrier($courseid);
+            return update_moduleinfo_under_flow_barrier($cm, $moduleinfo, $course, $mform);
+        });
+    }
+    return update_moduleinfo_under_flow_barrier($cm, $moduleinfo, $course, $mform);
+}
+
+/** Keep the Flow course barrier before Core updates course_modules. */
+function update_moduleinfo_under_flow_barrier($cm, $moduleinfo, $course, $mform = null) {
     global $DB, $CFG;
 
     $data = new stdClass();

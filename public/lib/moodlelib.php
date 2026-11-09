@@ -4776,6 +4776,48 @@ function delete_course($courseorid, $showfeedback = true) {
  *             failed, but you have no way of knowing which.
  */
 function remove_course_contents($courseid, $showfeedback = true, ?array $options = null, bool $coursedeletion = true) {
+    global $CFG, $DB;
+    require_once($CFG->libdir . '/completionlib.php');
+    $provider = '\\report_reportsflow\\local\\regulatory_completion_preservation_service';
+    if (!class_exists($provider)) {
+        return remove_course_contents_under_flow_barrier($courseid, $showfeedback, $options, $coursedeletion);
+    }
+    $courseids = [(int)$courseid];
+    $referencing = $DB->get_fieldset_sql(
+        'SELECT DISTINCT course FROM {course_completion_criteria} WHERE criteriatype = ? AND courseinstance = ?',
+        [COMPLETION_CRITERIA_TYPE_COURSE, $courseid]);
+    $courseids = array_values(array_unique(array_merge($courseids, array_map('intval', $referencing))));
+    sort($courseids, SORT_NUMERIC);
+    return $provider::with_course_barriers($courseids, static function() use ($DB, $provider, $courseids,
+            $courseid, $showfeedback, $options, $coursedeletion) {
+        foreach ($courseids as $id) {
+            $provider::assert_course_barrier($id);
+        }
+        $fresh = array_map('intval', $DB->get_fieldset_sql(
+            'SELECT DISTINCT course FROM {course_completion_criteria} WHERE criteriatype = ? AND courseinstance = ?',
+            [COMPLETION_CRITERIA_TYPE_COURSE, $courseid]));
+        if (array_diff($fresh, $courseids)) {
+            throw new \report_reportsflow\local\preservation_unavailable_exception('scope_expansion');
+        }
+        return remove_course_contents_under_flow_barrier($courseid, $showfeedback, $options, $coursedeletion);
+    });
+}
+
+/** Existing course-content removal workflow, reached after its completion barriers. */
+function remove_course_contents_under_flow_barrier($courseid, $showfeedback = true,
+        ?array $options = null, bool $coursedeletion = true) {
+    global $CFG, $DB;
+    require_once($CFG->libdir . '/completionlib.php');
+    $provider = '\\report_reportsflow\\local\\regulatory_completion_preservation_service';
+    if (class_exists($provider)) {
+        $provider::assert_course_barrier((int)$courseid);
+        $referencing = $DB->get_fieldset_sql(
+            'SELECT DISTINCT course FROM {course_completion_criteria} WHERE criteriatype = ? AND courseinstance = ?',
+            [COMPLETION_CRITERIA_TYPE_COURSE, $courseid]);
+        foreach ($referencing as $referencedby) {
+            $provider::assert_course_barrier((int)$referencedby);
+        }
+    }
     global $CFG, $DB, $OUTPUT;
 
     require_once($CFG->libdir.'/badgeslib.php');

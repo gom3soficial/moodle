@@ -38,6 +38,63 @@ require_once($CFG->dirroot.'/completion/data_object.php');
  */
 class completion_criteria_completion extends data_object {
 
+    /** Lock the owning course before a criterion-completion insert. */
+    public function insert() {
+        return $this->with_flow_criterion_completion_barrier(fn() => parent::insert(), false, true);
+    }
+
+    /** Lock old and new owning courses before a criterion-completion update. */
+    public function update() {
+        return $this->with_flow_criterion_completion_barrier(fn() => parent::update(), true, true);
+    }
+
+    /** Lock the authoritative owning course before deletion. */
+    public function delete() {
+        return $this->with_flow_criterion_completion_barrier(fn() => parent::delete(), true, false);
+    }
+
+    /** Validate the criterion binding after B and before any inherited DB writer. */
+    private function with_flow_criterion_completion_barrier(callable $operation, bool $existing, bool $targetcriterion) {
+        global $DB;
+        $provider = '\\report_reportsflow\\local\\regulatory_completion_preservation_service';
+        if (!class_exists($provider) || ($existing && empty($this->id))) {
+            return $operation();
+        }
+        $old = $existing ? $DB->get_record($this->table, ['id' => $this->id],
+            'id,course,criteriaid', MUST_EXIST) : null;
+        $courseid = $targetcriterion ? (int)$this->course : null;
+        $criteriaid = $targetcriterion ? (int)$this->criteriaid : null;
+        $courseids = array_values(array_unique(array_filter([
+            $old === null ? null : (int)$old->course, $courseid], static fn($id) => $id !== null)));
+        if (!$courseids || array_filter($courseids, static fn($id) => $id < 1)
+                || ($targetcriterion && $criteriaid < 1)) {
+            throw new \report_reportsflow\local\preservation_unavailable_exception('record_scope_invalid');
+        }
+        sort($courseids, SORT_NUMERIC);
+        return $provider::with_course_barriers($courseids, function() use ($DB, $provider, $courseids,
+                $old, $courseid, $criteriaid, $targetcriterion, $operation) {
+            foreach ($courseids as $id) {
+                $provider::assert_course_barrier($id);
+            }
+            if ($old !== null) {
+                $fresh = $DB->get_record($this->table, ['id' => $this->id],
+                    'id,course,criteriaid', MUST_EXIST);
+                if ((int)$fresh->course !== (int)$old->course
+                        || (int)$fresh->criteriaid !== (int)$old->criteriaid) {
+                    throw new \report_reportsflow\local\preservation_unavailable_exception('record_scope_changed');
+                }
+            }
+            if ($targetcriterion) {
+                if ((int)$this->course !== $courseid || (int)$this->criteriaid !== $criteriaid
+                        || (int)$DB->get_field('course_completion_criteria', 'course',
+                            ['id' => $criteriaid], MUST_EXIST) !== $courseid) {
+                    throw new \report_reportsflow\local\preservation_unavailable_exception('record_scope_changed');
+                }
+            }
+            return $operation();
+        });
+    }
+
     /* @var string Database table that stores completion type criteria */
     public $table = 'course_completion_crit_compl';
 
@@ -107,6 +164,16 @@ class completion_criteria_completion extends data_object {
      * @return  int id of completion record.
      */
     public function mark_complete($timecompleted = null) {
+        $provider = '\\report_reportsflow\\local\\regulatory_completion_preservation_service';
+        if (class_exists($provider)) {
+            return $this->with_flow_criterion_completion_barrier(
+                fn() => $this->mark_complete_under_flow_barrier($timecompleted), !empty($this->id), true);
+        }
+        return $this->mark_complete_under_flow_barrier($timecompleted);
+    }
+
+    /** Existing criterion and canonical course completion sequence. */
+    private function mark_complete_under_flow_barrier($timecompleted) {
         if (empty($timecompleted)) {
             $timecompleted = time();
         }

@@ -691,6 +691,12 @@ final class completionlib_test extends advanced_testcase {
         $cm = (object)array('id' => 42, 'course' => 13);
         $c = new completion_info($course);
 
+        // The prewrite barrier verifies the authoritative module/course binding before deletion.
+        $DB->expects($this->once())
+            ->method('get_field')
+            ->with('course_modules', 'course', ['id' => 42], MUST_EXIST)
+            ->willReturn(13);
+
         // Check it works ok without data in session.
         /** @var $DB PHPUnit_Framework_MockObject_MockObject */
         $DB->expects($this->once())
@@ -2110,9 +2116,14 @@ final class completionlib_test extends advanced_testcase {
 
         $this->setUser($teacher);
 
+        // The prewrite boundary requires an existing criterion in the same course.
+        $criteria = completion_criteria::factory(['criteriatype' => COMPLETION_CRITERIA_TYPE_SELF]);
+        $criteria->course = $course->id;
+        $criteria->insert();
+
         $record = [
             'course'    => $course->id,
-            'criteriaid'    => 1,
+            'criteriaid'    => $criteria->id,
             'userid'    => $student->id,
             'timecompleted' => time()
         ];

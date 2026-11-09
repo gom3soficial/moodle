@@ -36,6 +36,64 @@ require_once('grade_object.php');
  * @license   http://www.gnu.org/copyleft/gpl.html GNU GPL v3 or later
  */
 class grade_grade extends grade_object {
+    /** Lock the owning course before a direct write to a Flow module grade. */
+    private function flow_with_grade_barrier(callable $operation) {
+        global $DB;
+        $provider = '\\report_reportsflow\\local\\regulatory_completion_preservation_service';
+        if (!class_exists($provider)) {
+            return $operation();
+        }
+        $old = !empty($this->id) ? $DB->get_record('grade_grades', ['id' => $this->id],
+            'id,itemid,userid', MUST_EXIST) : null;
+        $itemids = array_unique(array_filter([(int)($old->itemid ?? 0), (int)$this->itemid]));
+        $items = [];
+        $courseids = [];
+        foreach ($itemids as $itemid) {
+            $item = $DB->get_record('grade_items', ['id' => $itemid],
+                'id,courseid,itemtype,itemmodule,iteminstance');
+            if (!$item) {
+                continue;
+            }
+            $items[$itemid] = $item;
+            if ($item->itemtype === 'mod' && in_array($item->itemmodule, ['examflow', 'slideflow'], true)) {
+                if ((int)$item->courseid < 1) {
+                    throw new \report_reportsflow\local\preservation_unavailable_exception('record_scope_invalid');
+                }
+                $courseids[] = (int)$item->courseid;
+            }
+        }
+        if (!$courseids) {
+            return $operation();
+        }
+        $courseids = array_values(array_unique($courseids));
+        sort($courseids, SORT_NUMERIC);
+        return $provider::with_course_barriers($courseids, function() use ($DB, $provider, $old,
+                $items, $courseids, $operation) {
+            foreach ($courseids as $courseid) {
+                $provider::assert_course_barrier($courseid);
+            }
+            if ($old !== null) {
+                $fresh = $DB->get_record('grade_grades', ['id' => $this->id],
+                    'id,itemid,userid', MUST_EXIST);
+                if ((int)$fresh->itemid !== (int)$old->itemid || (int)$fresh->userid !== (int)$old->userid) {
+                    throw new \report_reportsflow\local\preservation_unavailable_exception('record_scope_changed');
+                }
+            }
+            foreach ($items as $itemid => $item) {
+                $fresh = $DB->get_record('grade_items', ['id' => $itemid],
+                    'id,courseid,itemtype,itemmodule,iteminstance', MUST_EXIST);
+                if ((int)$fresh->courseid !== (int)$item->courseid || $fresh->itemtype !== $item->itemtype
+                        || $fresh->itemmodule !== $item->itemmodule
+                        || (int)$fresh->iteminstance !== (int)$item->iteminstance) {
+                    throw new \report_reportsflow\local\preservation_unavailable_exception('record_scope_changed');
+                }
+            }
+            if (!isset($items[(int)$this->itemid])) {
+                throw new \report_reportsflow\local\preservation_unavailable_exception('record_scope_changed');
+            }
+            return $operation();
+        });
+    }
 
     /**
      * The DB table.
@@ -1068,6 +1126,11 @@ class grade_grade extends grade_object {
         return $this->finalgrade >= $this->grade_item->gradepass;
     }
 
+    /** Guard the inherited insert before it can write a Flow module grade. */
+    public function insert($source = null, $isbulkupdate = false) {
+        return $this->flow_with_grade_barrier(fn() => parent::insert($source, $isbulkupdate));
+    }
+
     /**
      * In addition to update() as defined in grade_object rounds the float numbers using php function,
      * the reason is we need to compare the db value with computed number to skip updates if possible.
@@ -1077,6 +1140,12 @@ class grade_grade extends grade_object {
      * @return bool success
      */
     public function update($source=null, $isbulkupdate = false) {
+        return $this->flow_with_grade_barrier(
+            fn() => $this->update_under_flow_barrier($source, $isbulkupdate));
+    }
+
+    /** @return bool success */
+    private function update_under_flow_barrier($source, $isbulkupdate) {
         $this->rawgrade = grade_floatval($this->rawgrade);
         $this->finalgrade = grade_floatval($this->finalgrade);
         $this->rawgrademin = grade_floatval($this->rawgrademin);
@@ -1155,6 +1224,11 @@ class grade_grade extends grade_object {
      * @return bool Returns true if the deletion was successful, false otherwise.
      */
     public function delete($source = null) {
+        return $this->flow_with_grade_barrier(fn() => $this->delete_under_flow_barrier($source));
+    }
+
+    /** @return bool success */
+    private function delete_under_flow_barrier($source) {
         global $DB;
         try {
             $transaction = $DB->start_delegated_transaction();

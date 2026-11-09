@@ -231,6 +231,12 @@ class provider implements
      * @param int $cmid The course module id. Provide this if you only want activity completion deleted.
      */
     public static function delete_completion(?\stdClass $user = null, ?int $courseid = null, ?int $cmid = null) {
+        return self::with_flow_completion_delete_barrier($courseid, $cmid,
+            static fn() => self::delete_completion_under_flow_barrier($user, $courseid, $cmid));
+    }
+
+    /** Execute the existing deletion only after the owning course barrier. */
+    private static function delete_completion_under_flow_barrier(?\stdClass $user, ?int $courseid, ?int $cmid) {
         global $DB;
 
         if (isset($cmid)) {
@@ -285,6 +291,13 @@ class provider implements
      * @param int $cmid The course module id. Provide this if you only want activity completion deleted.
      */
     public static function delete_completion_by_approved_userlist(approved_userlist $userlist, ?int $courseid = null, ?int $cmid = null) {
+        return self::with_flow_completion_delete_barrier($courseid, $cmid,
+            static fn() => self::delete_completion_by_approved_userlist_under_flow_barrier($userlist, $courseid, $cmid));
+    }
+
+    /** Execute the existing approved-user deletion only after the owning course barrier. */
+    private static function delete_completion_by_approved_userlist_under_flow_barrier(
+            approved_userlist $userlist, ?int $courseid, ?int $cmid) {
         global $DB;
         $userids = $userlist->get_userids();
 
@@ -337,5 +350,27 @@ class provider implements
             $DB->delete_records_select('course_completion_crit_compl', $sql, $params);
             $DB->delete_records_select('course_completions', $sql, $params);
         }
+    }
+
+    /** Lock the authoritative course before any privacy completion deletion. */
+    private static function with_flow_completion_delete_barrier(?int $courseid, ?int $cmid, callable $operation) {
+        global $DB;
+        $barrier = '\\report_reportsflow\\local\\regulatory_completion_preservation_service';
+        if (!class_exists($barrier) || ($courseid === null && $cmid === null)) {
+            return $operation();
+        }
+        if ($cmid !== null) {
+            $courseid = (int)$DB->get_field('course_modules', 'course', ['id' => $cmid], MUST_EXIST);
+        }
+        return $barrier::with_course_barriers([(int)$courseid], static function() use (
+                $barrier, $courseid, $cmid, $operation) {
+            global $DB;
+            $barrier::assert_course_barrier((int)$courseid);
+            if ($cmid !== null && (int)$DB->get_field('course_modules', 'course', ['id' => $cmid], MUST_EXIST)
+                    !== (int)$courseid) {
+                throw new \moodle_exception('invalidcoursemodule');
+            }
+            return $operation();
+        });
     }
 }

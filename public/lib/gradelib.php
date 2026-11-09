@@ -63,6 +63,29 @@ require_once($CFG->libdir . '/grade/grade_outcome.php');
  */
 function grade_update($source, $courseid, $itemtype, $itemmodule, $iteminstance, $itemnumber, $grades = null,
         $itemdetails = null, $isbulkupdate = false) {
+    $provider = '\\report_reportsflow\\local\\regulatory_completion_preservation_service';
+    if ($itemtype === 'mod' && in_array((string)$itemmodule, ['examflow', 'slideflow'], true)
+            && (int)$courseid > 0 && class_exists($provider)) {
+        $courseid = (int)$courseid;
+        return $provider::with_course_barriers([$courseid], static function() use ($provider, $source, $courseid,
+                $itemtype, $itemmodule, $iteminstance, $itemnumber, $grades, $itemdetails, $isbulkupdate) {
+            $provider::assert_course_barrier($courseid);
+            return grade_update_under_flow_barrier($source, $courseid, $itemtype, $itemmodule,
+                $iteminstance, $itemnumber, $grades, $itemdetails, $isbulkupdate);
+        });
+    }
+    return grade_update_under_flow_barrier($source, $courseid, $itemtype, $itemmodule,
+        $iteminstance, $itemnumber, $grades, $itemdetails, $isbulkupdate);
+}
+
+/** Existing gradebook writer, reached after B for Flow module items. */
+function grade_update_under_flow_barrier($source, $courseid, $itemtype, $itemmodule,
+        $iteminstance, $itemnumber, $grades = null, $itemdetails = null, $isbulkupdate = false) {
+    $provider = '\\report_reportsflow\\local\\regulatory_completion_preservation_service';
+    if ($itemtype === 'mod' && in_array((string)$itemmodule, ['examflow', 'slideflow'], true)
+            && (int)$courseid > 0 && class_exists($provider)) {
+        $provider::assert_course_barrier((int)$courseid);
+    }
     global $USER, $CFG, $DB;
 
     // only following grade_item properties can be changed in this function
