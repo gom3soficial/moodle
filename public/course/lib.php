@@ -702,6 +702,34 @@ function set_coursemodule_name($cmid, $name) {
  * @since Moodle 2.5
  */
 function course_delete_module($cmid, $async = false) {
+    global $DB;
+    $provider = '\\report_reportsflow\\local\\regulatory_completion_preservation_service';
+    if (!class_exists($provider)) {
+        return course_delete_module_under_flow_barrier($cmid, $async);
+    }
+    $module = $DB->get_record('course_modules', ['id' => $cmid], 'id,course');
+    if (!$module) {
+        return true;
+    }
+    $courseid = (int)$module->course;
+    return $provider::with_course_barriers([$courseid], static function() use ($DB, $provider,
+            $cmid, $async, $courseid) {
+        $provider::assert_course_barrier($courseid);
+        $fresh = $DB->get_record('course_modules', ['id' => $cmid], 'id,course');
+        if (!$fresh || (int)$fresh->course !== $courseid) {
+            throw new \report_reportsflow\local\preservation_unavailable_exception('record_scope_changed');
+        }
+        return course_delete_module_under_flow_barrier($cmid, $async);
+    });
+}
+
+/** Existing module removal workflow, reached after the course barrier. */
+function course_delete_module_under_flow_barrier($cmid, $async = false) {
+    global $DB;
+    $provider = '\\report_reportsflow\\local\\regulatory_completion_preservation_service';
+    if (class_exists($provider) && ($module = $DB->get_record('course_modules', ['id' => $cmid], 'id,course'))) {
+        $provider::assert_course_barrier((int)$module->course);
+    }
     // Check the 'course_module_background_deletion_recommended' hook first.
     // Only use asynchronous deletion if at least one plugin returns true and if async deletion has been requested.
     // Both are checked because plugins should not be allowed to dictate the deletion behaviour, only support/decline it.

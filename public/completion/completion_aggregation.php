@@ -39,6 +39,51 @@ require_once($CFG->dirroot.'/completion/data_object.php');
  */
 class completion_aggregation extends data_object {
 
+    /** Serialize aggregation-method creation with criterion clear and cron. */
+    public function insert() {
+        return $this->with_flow_aggregation_barrier(fn() => parent::insert(), false, true);
+    }
+
+    /** Lock both courses if an aggregation-method row is moved. */
+    public function update() {
+        return $this->with_flow_aggregation_barrier(fn() => parent::update(), true, true);
+    }
+
+    /** Delete under the authoritative owning course barrier. */
+    public function delete() {
+        return $this->with_flow_aggregation_barrier(fn() => parent::delete(), true, false);
+    }
+
+    /** The inherited data-object writers do not know about course B. */
+    private function with_flow_aggregation_barrier(callable $operation, bool $existing, bool $includeobjectcourse) {
+        global $DB;
+        $provider = '\\report_reportsflow\\local\\regulatory_completion_preservation_service';
+        if (!class_exists($provider) || ($existing && empty($this->id))) {
+            return $operation();
+        }
+        $oldcourseid = $existing
+            ? (int)$DB->get_field($this->table, 'course', ['id' => $this->id], MUST_EXIST) : null;
+        $newcourseid = $includeobjectcourse ? (int)$this->course : null;
+        $courseids = array_values(array_unique(array_filter([$oldcourseid, $newcourseid],
+            static fn($id) => $id !== null)));
+        if (in_array(0, $courseids, true) || !$courseids) {
+            throw new \report_reportsflow\local\preservation_unavailable_exception('record_scope_invalid');
+        }
+        sort($courseids, SORT_NUMERIC);
+        return $provider::with_course_barriers($courseids, function() use ($DB, $provider, $courseids,
+                $oldcourseid, $newcourseid, $operation) {
+            foreach ($courseids as $courseid) {
+                $provider::assert_course_barrier($courseid);
+            }
+            if (($oldcourseid !== null && (int)$DB->get_field($this->table, 'course',
+                    ['id' => $this->id], MUST_EXIST) !== $oldcourseid)
+                    || ($newcourseid !== null && (int)$this->course !== $newcourseid)) {
+                throw new \report_reportsflow\local\preservation_unavailable_exception('record_scope_changed');
+            }
+            return $operation();
+        });
+    }
+
     /* @var string Database table name that stores completion aggregation information */
     public $table = 'course_completion_aggr_methd';
 

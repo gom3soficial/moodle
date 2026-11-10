@@ -38,6 +38,71 @@ require_once($CFG->dirroot.'/completion/data_object.php');
  */
 class completion_completion extends data_object {
 
+    /** Direct inherited writes also participate in the course barrier. */
+    public function insert() {
+        global $DB;
+        $provider = '\\report_reportsflow\\local\\regulatory_completion_preservation_service';
+        if (!class_exists($provider)) {
+            return parent::insert();
+        }
+        $courseid = (int)$this->course;
+        $userid = (int)$this->userid;
+        if ($courseid < 1 || $userid < 1) {
+            throw new \report_reportsflow\local\preservation_unavailable_exception('record_scope_invalid');
+        }
+        return $provider::with_course_barriers([$courseid], function() use ($DB, $provider, $courseid, $userid) {
+            $provider::assert_course_barrier($courseid);
+            if ((int)$this->course !== $courseid || (int)$this->userid !== $userid
+                    || $DB->record_exists($this->table, ['course' => $courseid, 'userid' => $userid])) {
+                throw new \report_reportsflow\local\preservation_unavailable_exception('record_scope_changed');
+            }
+            return parent::insert();
+        });
+    }
+
+    /** Refuse a direct stale update that would change canonical identity or times. */
+    public function update() {
+        global $DB;
+        $provider = '\\report_reportsflow\\local\\regulatory_completion_preservation_service';
+        if (!class_exists($provider) || empty($this->id)) {
+            return parent::update();
+        }
+        $old = $DB->get_record($this->table, ['id' => $this->id], '*', MUST_EXIST);
+        $courseid = (int)$old->course;
+        return $provider::with_course_barriers([$courseid], function() use ($DB, $provider, $old, $courseid) {
+            $provider::assert_course_barrier($courseid);
+            $fresh = $DB->get_record($this->table, ['id' => $this->id], '*', MUST_EXIST);
+            if ((int)$fresh->course !== $courseid || (int)$fresh->userid !== (int)$old->userid
+                    || (int)$this->course !== $courseid || (int)$this->userid !== (int)$old->userid
+                    || ((int)$fresh->timeenrolled > 0 && (int)$this->timeenrolled !== (int)$fresh->timeenrolled)
+                    || ((int)$fresh->timestarted > 0 && (int)$this->timestarted !== (int)$fresh->timestarted)
+                    || ((int)$fresh->timecompleted > 0 && (int)$this->timecompleted !== (int)$fresh->timecompleted)) {
+                throw new \report_reportsflow\local\preservation_unavailable_exception('record_scope_changed');
+            }
+            return parent::update();
+        });
+    }
+
+    /** Direct deletion locks the row's authoritative course. */
+    public function delete() {
+        global $DB;
+        $provider = '\\report_reportsflow\\local\\regulatory_completion_preservation_service';
+        if (!class_exists($provider) || empty($this->id)) {
+            return parent::delete();
+        }
+        $old = $DB->get_record($this->table, ['id' => $this->id], 'id,course,userid', MUST_EXIST);
+        $courseid = (int)$old->course;
+        return $provider::with_course_barriers([$courseid], function() use ($DB, $provider, $old, $courseid) {
+            $provider::assert_course_barrier($courseid);
+            $fresh = $DB->get_record($this->table, ['id' => $this->id], 'id,course,userid', MUST_EXIST);
+            if ((int)$fresh->course !== $courseid || (int)$fresh->userid !== (int)$old->userid
+                    || (int)$this->course !== $courseid || (int)$this->userid !== (int)$old->userid) {
+                throw new \report_reportsflow\local\preservation_unavailable_exception('record_scope_changed');
+            }
+            return parent::delete();
+        });
+    }
+
     /* @var string $table Database table name that stores completion information */
     public $table = 'course_completions';
 
@@ -156,6 +221,29 @@ class completion_completion extends data_object {
      * @return  int|null id of completion record on successful update.
      */
     public function mark_complete($timecomplete = null) {
+        global $DB;
+        $provider = '\\report_reportsflow\\local\\regulatory_completion_preservation_service';
+        if ((int)$this->course > 0 && class_exists($provider)) {
+            $courseid = (int)$this->course;
+            return $provider::with_course_barriers([$courseid], function() use ($DB, $provider, $courseid, $timecomplete) {
+                $provider::assert_course_barrier($courseid);
+                // This object may have been fetched before B. A prior writer
+                // may already have marked the same learner complete.
+                $stored = $DB->get_record('course_completions',
+                    ['course' => $courseid, 'userid' => (int)$this->userid]);
+                if ($stored && (int)$stored->timecompleted > 0) {
+                    $this->id = (int)$stored->id;
+                    $this->timecompleted = (int)$stored->timecompleted;
+                    return null;
+                }
+                return $this->mark_complete_under_flow_barrier($timecomplete);
+            });
+        }
+        return $this->mark_complete_under_flow_barrier($timecomplete);
+    }
+
+    /** Existing Core completion workflow, called under B when ReportsFlow is installed. */
+    private function mark_complete_under_flow_barrier($timecomplete = null) {
         global $USER;
 
         // Never change a completion time.
@@ -219,6 +307,54 @@ class completion_completion extends data_object {
      * @return  int|null id of completion record on successful update.
      */
     private function _save() {
+        $provider = '\\report_reportsflow\\local\\regulatory_completion_preservation_service';
+        if ((int)$this->course > 0 && class_exists($provider)) {
+            $courseid = (int)$this->course;
+            return $provider::with_course_barriers([$courseid], function() use ($provider, $courseid) {
+                $provider::assert_course_barrier($courseid);
+                return $this->_save_under_flow_barrier();
+            });
+        }
+        return $this->_save_under_flow_barrier();
+    }
+
+    /** Existing Core record and cache write path. */
+    private function _save_under_flow_barrier() {
+        global $DB;
+        $provider = '\\report_reportsflow\\local\\regulatory_completion_preservation_service';
+        if ((int)$this->course > 0 && class_exists($provider)) {
+            $provider::assert_course_barrier((int)$this->course);
+            if (isset($this->id) && (int)$this->id < 1) {
+                // Preserve data_object's invalid-ID refusal without touching a
+                // real canonical row that now exists for this course and user.
+                $this->update();
+                return null;
+            }
+            $stored = $DB->get_record('course_completions',
+                ['course' => (int)$this->course, 'userid' => (int)$this->userid]);
+            if ($stored) {
+                if (isset($this->id) && (int)$this->id !== (int)$stored->id) {
+                    throw new \report_reportsflow\local\preservation_unavailable_exception('record_scope_changed');
+                }
+                $this->id = (int)$stored->id;
+                // An object loaded before B must not undo an earlier enrollment,
+                // start or completion when it saves its own later transition.
+                if ((int)$stored->timeenrolled > 0) {
+                    $this->timeenrolled = (int)$stored->timeenrolled;
+                }
+                if ((int)$stored->timestarted > 0) {
+                    $this->timestarted = (int)$stored->timestarted;
+                }
+                if ((int)$stored->timecompleted > 0) {
+                    $this->timecompleted = (int)$stored->timecompleted;
+                }
+                if ((int)$stored->reaggregate > (int)$this->reaggregate) {
+                    $this->reaggregate = (int)$stored->reaggregate;
+                }
+            } else if (isset($this->id)) {
+                throw new \report_reportsflow\local\preservation_unavailable_exception('record_scope_changed');
+            }
+        }
         if ($this->timeenrolled === null) {
             $this->timeenrolled = 0;
         }

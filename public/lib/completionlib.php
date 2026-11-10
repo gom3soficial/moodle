@@ -492,17 +492,53 @@ class completion_info {
      */
     public function clear_criteria(bool $removetypecriteria = true): void {
         global $DB;
+        $provider = '\\report_reportsflow\\local\\regulatory_completion_preservation_service';
+        if (!class_exists($provider)) {
+            $this->clear_criteria_under_flow_barrier($removetypecriteria);
+            return;
+        }
+        $courseids = [(int)$this->course_id];
+        if ($removetypecriteria) {
+            $referencing = $DB->get_fieldset_sql(
+                'SELECT DISTINCT course FROM {course_completion_criteria} WHERE criteriatype = ? AND courseinstance = ?',
+                [COMPLETION_CRITERIA_TYPE_COURSE, $this->course_id]);
+            $courseids = array_values(array_unique(array_merge($courseids, array_map('intval', $referencing))));
+        }
+        sort($courseids, SORT_NUMERIC);
+        $provider::with_course_barriers($courseids, function() use ($provider, $courseids, $removetypecriteria): void {
+            foreach ($courseids as $courseid) {
+                $provider::assert_course_barrier($courseid);
+            }
+            $this->clear_criteria_under_flow_barrier($removetypecriteria, $courseids);
+        });
+    }
+
+    /** Delete only from the course scopes already locked by the caller. */
+    private function clear_criteria_under_flow_barrier(bool $removetypecriteria, ?array $lockedcourseids = null): void {
+        global $DB;
 
         $select = 'course = :course';
         $params = ['course' => $this->course->id];
 
         // Remove completion criteria records for the course itself, and any records that refer to the course.
         if ($removetypecriteria) {
-            $select .= ' OR (criteriatype = :type AND courseinstance = :courseinstance)';
+            $referencewhere = 'criteriatype = :type AND courseinstance = :courseinstance';
             $params = array_merge($params, [
                 'type' => COMPLETION_CRITERIA_TYPE_COURSE,
                 'courseinstance' => $this->course_id,
             ]);
+            if ($lockedcourseids !== null) {
+                $fresh = array_map('intval', $DB->get_fieldset_sql(
+                    'SELECT DISTINCT course FROM {course_completion_criteria} WHERE criteriatype = ? AND courseinstance = ?',
+                    [COMPLETION_CRITERIA_TYPE_COURSE, $this->course_id]));
+                if (array_diff($fresh, $lockedcourseids)) {
+                    throw new \report_reportsflow\local\preservation_unavailable_exception('scope_expansion');
+                }
+                [$insql, $inparams] = $DB->get_in_or_equal($lockedcourseids, SQL_PARAMS_NAMED, 'flowcourse');
+                $referencewhere .= ' AND course ' . $insql;
+                $params = array_merge($params, $inparams);
+            }
+            $select .= ' OR (' . $referencewhere . ')';
         }
 
         $DB->delete_records_select('course_completion_criteria', $select, $params);
@@ -573,6 +609,33 @@ class completion_info {
      */
     public function update_state($cm, $possibleresult=COMPLETION_UNKNOWN, $userid=0,
             $override = false, $isbulkupdate = false) {
+        global $DB, $USER;
+
+        // Flow activity completion is a native Core write. Take the ReportsFlow
+        // course barrier before Core changes caches, starts a transaction or
+        // writes course_modules_completion; a later event cannot protect it.
+        $provider = '\\report_reportsflow\\local\\regulatory_completion_preservation_service';
+        $modname = !empty($cm->modname) ? $cm->modname : $DB->get_field('modules', 'name', ['id' => $cm->module]);
+        if (in_array((string)$modname, ['examflow', 'slideflow'], true) && class_exists($provider)) {
+            $courseid = (int)$cm->course;
+            return $provider::with_course_barriers([$courseid], function() use (
+                    $DB, $cm, $possibleresult, $userid, $override, $isbulkupdate, $provider, $courseid) {
+                if ((int)$DB->get_field('course_modules', 'course', ['id' => (int)$cm->id], MUST_EXIST) !== $courseid
+                        || $courseid !== (int)$this->course_id) {
+                    throw new \moodle_exception('invalidcoursemodule');
+                }
+                $provider::assert_course_barrier($courseid);
+                return $this->update_state_under_flow_barrier($cm, $possibleresult, $userid,
+                    $override, $isbulkupdate);
+            });
+        }
+        return $this->update_state_under_flow_barrier($cm, $possibleresult, $userid,
+            $override, $isbulkupdate);
+    }
+
+    /** Existing Core completion workflow, called under B for Flow activities. */
+    private function update_state_under_flow_barrier($cm, $possibleresult, $userid,
+            $override, $isbulkupdate) {
         global $DB, $USER;
 
         // Do nothing if the mod plugin type is disabled.
@@ -882,6 +945,11 @@ class completion_info {
      * Intended to be used when unlocking completion criteria settings.
      */
     public function delete_course_completion_data() {
+        return $this->flow_with_course_barrier(fn() => $this->delete_course_completion_data_under_flow_barrier());
+    }
+
+    /** Keep the canonical and criterion deletes in one course scope. */
+    private function delete_course_completion_data_under_flow_barrier() {
         global $DB;
 
         $DB->delete_records('course_completions', array('course' => $this->course_id));
@@ -899,6 +967,11 @@ class completion_info {
      * Used by course reset page.
      */
     public function delete_all_completion_data() {
+        return $this->flow_with_course_barrier(fn() => $this->delete_all_completion_data_under_flow_barrier());
+    }
+
+    /** Keep activity and course deletes in one course scope. */
+    private function delete_all_completion_data_under_flow_barrier() {
         global $DB;
 
         // Delete from database.
@@ -920,6 +993,18 @@ class completion_info {
      * @param stdClass|cm_info $cm Activity
      */
     public function delete_all_state($cm) {
+        return $this->flow_with_course_barrier(function() use ($cm) {
+            global $DB;
+            if ((int)$DB->get_field('course_modules', 'course', ['id' => (int)$cm->id], MUST_EXIST)
+                    !== (int)$this->course_id || (isset($cm->course) && (int)$cm->course !== (int)$this->course_id)) {
+                throw new \moodle_exception('invalidcoursemodule');
+            }
+            return $this->delete_all_state_under_flow_barrier($cm);
+        });
+    }
+
+    /** Existing activity deletion workflow. */
+    private function delete_all_state_under_flow_barrier($cm) {
         global $DB;
 
         // Delete from database
@@ -960,6 +1045,11 @@ class completion_info {
      * @param stdClass|cm_info $cm Activity
      */
     public function reset_all_state($cm) {
+        return $this->flow_with_course_barrier(fn() => $this->reset_all_state_under_flow_barrier($cm));
+    }
+
+    /** Existing course activity recalculation workflow. */
+    private function reset_all_state_under_flow_barrier($cm) {
         global $DB;
 
         if ($cm->completion == COMPLETION_TRACKING_MANUAL) {
@@ -988,6 +1078,19 @@ class completion_info {
         foreach ($keepusers as $keepuser) {
             $this->update_state($cm, COMPLETION_UNKNOWN, $keepuser);
         }
+    }
+
+    /** Serialize Core's course-wide completion resets before their first delete. */
+    private function flow_with_course_barrier(callable $operation) {
+        $provider = '\\report_reportsflow\\local\\regulatory_completion_preservation_service';
+        if (!class_exists($provider)) {
+            return $operation();
+        }
+        $courseid = (int)$this->course_id;
+        return $provider::with_course_barriers([$courseid], static function() use ($provider, $courseid, $operation) {
+            $provider::assert_course_barrier($courseid);
+            return $operation();
+        });
     }
 
     /**
@@ -1235,6 +1338,27 @@ class completion_info {
      * @param bool $isbulkupdate If bulk grade update is happening.
      */
     public function internal_set_data($cm, $data, $isbulkupdate = false) {
+        global $DB;
+        $provider = '\\report_reportsflow\\local\\regulatory_completion_preservation_service';
+        $modname = !empty($cm->modname) ? $cm->modname : $DB->get_field('modules', 'name', ['id' => $cm->module]);
+        if (in_array((string)$modname, ['examflow', 'slideflow'], true) && class_exists($provider)) {
+            $courseid = (int)$cm->course;
+            return $provider::with_course_barriers([$courseid], function() use ($DB, $cm, $data,
+                    $isbulkupdate, $provider, $courseid) {
+                if ((int)$DB->get_field('course_modules', 'course', ['id' => (int)$cm->id], MUST_EXIST) !== $courseid
+                        || $courseid !== (int)$this->course_id
+                        || (int)$data->coursemoduleid !== (int)$cm->id) {
+                    throw new \moodle_exception('invalidcoursemodule');
+                }
+                $provider::assert_course_barrier($courseid);
+                return $this->internal_set_data_under_flow_barrier($cm, $data, $isbulkupdate);
+            });
+        }
+        return $this->internal_set_data_under_flow_barrier($cm, $data, $isbulkupdate);
+    }
+
+    /** Existing Core storage path, also reached by direct callers. */
+    private function internal_set_data_under_flow_barrier($cm, $data, $isbulkupdate) {
         global $USER, $DB, $CFG;
         require_once($CFG->dirroot.'/completion/criteria/completion_criteria_activity.php');
 
@@ -1751,6 +1875,72 @@ function completion_cron_aggregate($method, $data, &$state) {
  * @since Moodle 4.0
  */
 function aggregate_completions(int $coursecompletionid, bool $mtraceprogress = false) {
+    global $DB;
+    $provider = '\\report_reportsflow\\local\\regulatory_completion_preservation_service';
+    if (!class_exists($provider)) {
+        aggregate_completions_under_flow_barrier($coursecompletionid, $mtraceprogress);
+        return;
+    }
+    if ($coursecompletionid) {
+        $record = $DB->get_record('course_completions', ['id' => $coursecompletionid], 'id,course');
+        if (!$record) {
+            return;
+        }
+        $courseid = (int)$record->course;
+        $provider::with_course_barriers([$courseid], static function() use ($DB, $provider,
+                $courseid, $coursecompletionid, $mtraceprogress): void {
+            $provider::assert_course_barrier($courseid);
+            $fresh = $DB->get_record('course_completions', ['id' => $coursecompletionid], 'id,course');
+            if (!$fresh || (int)$fresh->course !== $courseid) {
+                throw new \report_reportsflow\local\preservation_unavailable_exception('record_scope_changed');
+            }
+            aggregate_completions_under_flow_barrier($coursecompletionid, $mtraceprogress);
+        });
+        return;
+    }
+
+    if ($mtraceprogress) {
+        mtrace('Aggregating completions');
+    }
+    $started = time();
+    // Each pending canonical row is read and written only while its own course B
+    // is held. Newly queued rows are picked up on the next cron pass.
+    $maxid = (int)$DB->get_field_sql('SELECT MAX(id) FROM {course_completions}');
+    $lastid = 0;
+    do {
+        $pending = $DB->get_records_select('course_completions',
+            'id > ? AND id <= ? AND reaggregate > 0 AND reaggregate < ?',
+            [$lastid, $maxid, $started], 'id ASC', 'id,course', 0, 256);
+        foreach ($pending as $record) {
+            $courseid = (int)$record->course;
+            $id = (int)$record->id;
+            $lastid = $id;
+            $provider::with_course_barriers([$courseid], static function() use ($DB, $provider,
+                    $courseid, $id, $started, $mtraceprogress): void {
+                $provider::assert_course_barrier($courseid);
+                $fresh = $DB->get_record('course_completions', ['id' => $id], 'id,course,userid,reaggregate');
+                if (!$fresh) {
+                    return;
+                }
+                if ((int)$fresh->course !== $courseid) {
+                    throw new \report_reportsflow\local\preservation_unavailable_exception('record_scope_changed');
+                }
+                if ((int)$fresh->reaggregate <= 0 || (int)$fresh->reaggregate >= $started) {
+                    return;
+                }
+                if ($mtraceprogress) {
+                    mtrace('Aggregating completions for user ' . $fresh->userid . ' in course ' . $courseid);
+                }
+                aggregate_completions_under_flow_barrier($id, false);
+                $DB->set_field_select('course_completions', 'reaggregate', 0,
+                    'id = ? AND course = ? AND reaggregate > 0 AND reaggregate < ?', [$id, $courseid, $started]);
+            });
+        }
+    } while (count($pending) === 256);
+}
+
+/** Existing aggregation algorithm; the entry point above owns its course barriers. */
+function aggregate_completions_under_flow_barrier(int $coursecompletionid, bool $mtraceprogress = false) {
     global $DB;
 
     if (!$coursecompletionid && $mtraceprogress) {

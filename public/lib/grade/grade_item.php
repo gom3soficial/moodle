@@ -37,6 +37,55 @@ require_once('grade_object.php');
  * @license   http://www.gnu.org/copyleft/gpl.html GNU GPL v3 or later
  */
 class grade_item extends grade_object {
+    /** Lock a Flow grade item's old and new course before an inherited writer. */
+    private function flow_with_grade_item_barrier(callable $operation) {
+        global $DB;
+        $provider = '\\report_reportsflow\\local\\regulatory_completion_preservation_service';
+        if (!class_exists($provider)) {
+            return $operation();
+        }
+        $old = !empty($this->id) ? $DB->get_record('grade_items', ['id' => $this->id],
+            'id,courseid,itemtype,itemmodule,iteminstance', MUST_EXIST) : null;
+        $new = [(int)$this->courseid, (string)$this->itemtype,
+            (string)$this->itemmodule, (int)$this->iteminstance];
+        $courseids = [];
+        foreach ([$old ? [(int)$old->courseid, (string)$old->itemtype,
+                (string)$old->itemmodule] : null, $new] as $item) {
+            if ($item !== null && $item[1] === 'mod'
+                    && in_array($item[2], ['examflow', 'slideflow'], true)) {
+                if ($item[0] < 1) {
+                    throw new \report_reportsflow\local\preservation_unavailable_exception('record_scope_invalid');
+                }
+                $courseids[] = $item[0];
+            }
+        }
+        if (!$courseids) {
+            return $operation();
+        }
+        $courseids = array_values(array_unique($courseids));
+        sort($courseids, SORT_NUMERIC);
+        return $provider::with_course_barriers($courseids, function() use ($DB, $provider,
+                $courseids, $old, $new, $operation) {
+            foreach ($courseids as $courseid) {
+                $provider::assert_course_barrier($courseid);
+            }
+            if ($old !== null) {
+                $fresh = $DB->get_record('grade_items', ['id' => $this->id],
+                    'id,courseid,itemtype,itemmodule,iteminstance', MUST_EXIST);
+                if ((int)$fresh->courseid !== (int)$old->courseid
+                        || (string)$fresh->itemtype !== (string)$old->itemtype
+                        || (string)$fresh->itemmodule !== (string)$old->itemmodule
+                        || (int)$fresh->iteminstance !== (int)$old->iteminstance) {
+                    throw new \report_reportsflow\local\preservation_unavailable_exception('record_scope_changed');
+                }
+            }
+            if ([(int)$this->courseid, (string)$this->itemtype,
+                    (string)$this->itemmodule, (int)$this->iteminstance] !== $new) {
+                throw new \report_reportsflow\local\preservation_unavailable_exception('record_scope_changed');
+            }
+            return $operation();
+        });
+    }
     /**
      * DB Table (used by grade_object).
      * @var string $table
@@ -302,6 +351,12 @@ class grade_item extends grade_object {
      * @return bool success
      */
     public function update($source = null, $isbulkupdate = false) {
+        return $this->flow_with_grade_item_barrier(
+            fn() => $this->update_under_flow_barrier($source, $isbulkupdate));
+    }
+
+    /** Existing grade-item update after the optional Flow course barrier. */
+    private function update_under_flow_barrier($source = null, $isbulkupdate = false) {
         // reset caches
         $this->dependson_cache = null;
 
@@ -429,6 +484,11 @@ class grade_item extends grade_object {
      * @return bool success
      */
     public function delete($source=null) {
+        return $this->flow_with_grade_item_barrier(fn() => $this->delete_under_flow_barrier($source));
+    }
+
+    /** Existing grade-item deletion after the optional Flow course barrier. */
+    private function delete_under_flow_barrier($source=null) {
         global $DB;
 
         try {
@@ -525,6 +585,12 @@ class grade_item extends grade_object {
      * @return int PK ID if successful, false otherwise
      */
     public function insert($source = null, $isbulkupdate = false) {
+        return $this->flow_with_grade_item_barrier(
+            fn() => $this->insert_under_flow_barrier($source, $isbulkupdate));
+    }
+
+    /** Existing grade-item insertion after the optional Flow course barrier. */
+    private function insert_under_flow_barrier($source = null, $isbulkupdate = false) {
         global $CFG, $DB;
 
         if (empty($this->courseid)) {
@@ -1868,6 +1934,14 @@ class grade_item extends grade_object {
      */
     public function update_final_grade($userid, $finalgrade = false, $source = null, $feedback = false,
             $feedbackformat = FORMAT_MOODLE, $usermodified = null, $timemodified = null, $isbulkupdate = false) {
+        return $this->flow_with_grade_item_barrier(fn() => $this->update_final_grade_under_flow_barrier(
+            $userid, $finalgrade, $source, $feedback, $feedbackformat, $usermodified,
+            $timemodified, $isbulkupdate));
+    }
+
+    /** Existing final-grade writer after the optional Flow course barrier. */
+    private function update_final_grade_under_flow_barrier($userid, $finalgrade, $source, $feedback,
+            $feedbackformat, $usermodified, $timemodified, $isbulkupdate) {
         global $USER, $CFG;
 
         $result = true;
