@@ -636,19 +636,71 @@ function can_update_moduleinfo($cm) {
 function update_moduleinfo($cm, $moduleinfo, $course, $mform = null) {
     global $DB;
     $provider = '\\report_reportsflow\\local\\regulatory_completion_preservation_service';
-    if (in_array((string)($moduleinfo->modulename ?? ''), ['examflow', 'slideflow'], true)
-            && class_exists($provider)) {
+    $isflow = in_array((string)($moduleinfo->modulename ?? ''), ['examflow', 'slideflow'], true);
+    $update = static function() use ($cm, $moduleinfo, $course, $mform) {
+        return update_moduleinfo_under_flow_barrier($cm, $moduleinfo, $course, $mform);
+    };
+    if ($isflow && class_exists($provider)) {
         $courseid = (int)$course->id;
         return $provider::with_course_barriers([$courseid], static function() use (
-                $DB, $cm, $moduleinfo, $course, $mform, $courseid, $provider) {
+                $DB, $cm, $moduleinfo, $courseid, $provider, $update) {
             if ((int)$DB->get_field('course_modules', 'course', ['id' => (int)$cm->id], MUST_EXIST) !== $courseid) {
                 throw new \moodle_exception('invalidcoursemodule');
             }
             $provider::assert_course_barrier($courseid);
-            return update_moduleinfo_under_flow_barrier($cm, $moduleinfo, $course, $mform);
+            update_moduleinfo_preserve_flow_intro($cm, $moduleinfo);
+            return update_moduleinfo_in_flow_transaction($courseid, $update);
         });
     }
-    return update_moduleinfo_under_flow_barrier($cm, $moduleinfo, $course, $mform);
+    if ($isflow) {
+        update_moduleinfo_preserve_flow_intro($cm, $moduleinfo);
+        return update_moduleinfo_in_flow_transaction((int)$course->id, $update);
+    }
+    return $update();
+}
+
+/** Keep old intro blobs referenced while FileAPI and SQL have different rollback semantics. */
+function update_moduleinfo_preserve_flow_intro($cm, $moduleinfo): void {
+    $context = context_module::instance((int)$cm->id);
+    $component = 'mod_' . $moduleinfo->modulename;
+    if (!get_file_storage()->get_area_files($context->id, $component, 'intro', 0, 'id', false)) {
+        return;
+    }
+    // Use a separate private, expiring draft reference rather than a physical
+    // copy or a trash-directory assumption. Keep it until normal draft cleanup:
+    // an enclosing caller may still roll back after this helper returns.
+    $safetyid = 0;
+    file_prepare_draft_area($safetyid, $context->id, $component, 'intro', 0, ['subdirs' => true]);
+}
+
+/** Keep a Flow settings update and its mandatory audit in one SQL owner phase. */
+function update_moduleinfo_in_flow_transaction(int $courseid, callable $update) {
+    global $DB;
+    // The optional course preservation barrier must already be held. Starting
+    // this transaction before acquiring that barrier would invert its lock order.
+    $transaction = $DB->start_delegated_transaction();
+    try {
+        $result = $update();
+        $transaction->allow_commit();
+        return $result;
+    } catch (Throwable $error) {
+        try {
+            $transaction->rollback($error);
+        } finally {
+            // Module callbacks may have warmed a cache with uncommitted values.
+            // A rolled-back revision can be reused by the next increment, so
+            // remove that versioned entry as well as resetting in-request state.
+            $cache = cache::make('core', 'coursemodinfo');
+            $cache->acquire_lock($courseid);
+            try {
+                $cache->delete($courseid);
+            } finally {
+                $cache->release_lock($courseid);
+            }
+            rebuild_course_cache($courseid, true);
+        }
+        throw $error;
+    }
 }
 
 /** Keep the Flow course barrier before Core updates course_modules. */
