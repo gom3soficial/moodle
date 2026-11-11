@@ -714,6 +714,7 @@ class completion_info {
 
         // If the overall completion state has changed, update it in the cache.
         if ($newstate != $current->completionstate) {
+            $this->require_flow_learning_admission($cm, (int)$userid);
             $current->completionstate = $newstate;
             $current->timemodified    = time();
             $current->overrideby      = $override ? $USER->id : null;
@@ -731,6 +732,34 @@ class completion_info {
                 );
                 \core\di::get(\core\hook\manager::class)->dispatch($hook);
             }
+        }
+    }
+
+    /**
+     * Keep learner-owned Flow progress behind its existing required-purpose contract.
+     *
+     * Native staff overrides and server projections for another subject remain
+     * operational Core actions. This gate neither grants permissions nor turns
+     * a native completion flag into original signed learning evidence.
+     *
+     * @param stdClass|cm_info $cm activity
+     * @param int $userid completion subject
+     */
+    private function require_flow_learning_admission($cm, int $userid): void {
+        global $DB, $USER;
+        $modname = !empty($cm->modname) ? $cm->modname
+            : $DB->get_field('modules', 'name', ['id' => $cm->module]);
+        if (!in_array((string)$modname, ['slideflow', 'examflow'], true)
+                || $userid <= 0 || $userid !== (int)$USER->id
+                || $this->user_can_override_completion($USER)) {
+            return;
+        }
+        $bridge = '\\mod_' . $modname . '\\local\\privacyflow_bridge';
+        if (class_exists($bridge) && method_exists($bridge, 'enforce_activity_admission')
+                && defined($bridge . '::LEARNING_PROGRESS')) {
+            $bridge::enforce_activity_admission($bridge::LEARNING_PROGRESS, $userid);
+        } else if (class_exists('\\local_privacyflow\\api')) {
+            throw new coding_exception('Flow learning progress admission contract is unavailable.');
         }
     }
 
@@ -1362,6 +1391,8 @@ class completion_info {
         global $USER, $DB, $CFG;
         require_once($CFG->dirroot.'/completion/criteria/completion_criteria_activity.php');
 
+        // Also cover direct Core callers, before SQL or completion-cache writes.
+        $this->require_flow_learning_admission($cm, (int)$data->userid);
         $transaction = $DB->start_delegated_transaction();
         if (!$data->id) {
             // Check there isn't really a row

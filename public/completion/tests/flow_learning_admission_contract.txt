@@ -1,0 +1,34 @@
+Flow native completion admission contract
+
+The existing plugin declaration makes learning progress, including completion
+state, required_for_activity. A learner's native Core checkbox or direct Core
+storage call must not create new Flow progress when that purpose is pending,
+denied or misconfigured. Admission is checked before mutation and again at the
+direct storage boundary, under the already-existing optional RF course barrier.
+
+Use the existing mod_slideflow/mod_examflow privacyflow_bridge contract:
+LEARNING_PROGRESS plus enforce_activity_admission(processingkey, userid).
+Preparation and valid ALLOW remain operational; the bridge's absent optional
+PrivacyFlow path remains available. An incomplete bridge with PrivacyFlow
+present fails closed. No global Moodle policy dependency is added for other mods.
+
+This gate concerns the current learner writing their own new progress. Native
+Moodle authorisation remains responsible for staff overrides and trusted server
+projections for another subject. Actors with the existing native permission
+moodle/course:overridecompletion retain operational staff behaviour. This is not
+a new permission grant or a certification of learning. Historical unchanged
+completion is not rewritten, revoked or made dependent on a fresh interaction.
+
+Core flags and staff overrides never substitute for original signed learning
+attempts, sessions, assessment results or retained privacy evidence. ReportsFlow
+source validation continues to fail closed without that independent source.
+
+Native integration coverage: ReportsFlow core_completion_privacy_boundary_test.
+Native Core compatibility: completion/tests/flow_learning_admission_test.php.
+Fast contract: php completion/tests/flow_learning_admission_pure.php MODE,
+where MODE is supported, missing_bridge, missing_method, missing_constant or
+standalone. It extracts the actual private method but uses explicit API, DB and
+native-capability doubles; report native runtime tests separately.
+
+No policy text, environment mode, audience, key, retention or schema is changed.
+This increment is not the later three-modes-per-course/coordinator architecture.
