@@ -1,0 +1,37 @@
+Flow activity settings: transaction and file preservation contract
+
+Scope: update_moduleinfo for mod_slideflow and mod_examflow only. Other module
+types keep the native update path. This is a Flow-specific downstream Core patch.
+
+Acquire the optional ReportsFlow course barrier and validate its course before
+starting SQL. Preserve existing intro files through separate private user draft
+references before entering the SQL phase. Execute native module, course-module,
+gradebook, publication and required audit changes in one delegated transaction.
+When the configured protected audit destination fails, propagate the failure and
+roll back native SQL. Delete the affected coursemodinfo entry after rollback and
+invalidate that course's in-request cache: a rolled-back revision can otherwise
+be reused and expose the refused settings.
+
+The safety draft uses native FileAPI references, including with a remote storage
+backend; it is not a physical copy or an assumption about the trash directory.
+Keep it after return because an enclosing caller may still roll back. Native
+draft cleanup expires these private references. No permanent backup is claimed.
+The helper does not undo external side effects of arbitrary third-party callbacks.
+An enclosing transaction owner remains responsible for its later rollback/cache.
+
+Preparation continues to bypass policy acceptance for configuration, while
+administrative audit remains enabled. This patch does not create course modes,
+change privacy policy requirements, publish policies or backfill old receipts.
+
+Native tests: flow_activity_settings_transaction_test in core_course_testsuite.
+Integration: report_reportsflow activity_settings_audit_atomicity_test, with both
+Flow activities and an explicitly provisioned disposable critical audit store.
+Fast contract: php course/tests/flow_settings_transaction_pure.php with_provider
+and without_provider. These fast tests extract the actual wrapper/helper functions
+but use explicit provider/database/cache doubles, not a native Moodle runtime.
+
+Qualification on the reused Moodle 5.1.5 family QA covers its native runtime.
+Executing the MOODLE_501_STABLE candidate file in that QA is compatibility
+evidence for that file, not a full native 5.1.8 deployment qualification.
+Keep that distinction in release records. Deploy only the qualified version's
+file after verifying the installed pins and taking a reversible code backup.
